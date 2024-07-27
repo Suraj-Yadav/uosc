@@ -2,11 +2,17 @@ package lib
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"net/http"
 	"os"
+	"strconv"
+	"strings"
+	"time"
 )
 
 type ErrorData struct {
@@ -33,30 +39,124 @@ func Must[T any](t T, err error) T {
 
 const OSDBChunkSize = 65536 // 64k
 
-// Generate an OSDB hash for a file.
-func OSDBHashFile(filePath string) (hash string, err error) {
+type chunkInfo struct {
+	offset int64
+	size   int64
+}
+
+func readRemoteChunks(url string, minimumRequiredSize int64, chunks ...chunkInfo) (fileSize int64, buf []byte, err error) {
+	client := &http.Client{}
+
+	ctx, cancelFunc := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancelFunc()
+
+	req, err := http.NewRequestWithContext(ctx, "HEAD", url, nil)
+	if err != nil {
+		return
+	}
+
+	res, err := client.Do(req)
+	if err != nil {
+		return
+	}
+
+	header := res.Header
+	if accept_ranges, ok := header["Accept-Ranges"]; !ok || accept_ranges[0] != "bytes" {
+		err = errors.New("URL doesn't support range fetch")
+		return
+	}
+
+	fileSize, err = strconv.ParseInt(header["Content-Length"][0], 10, 64)
+	if err != nil {
+		return
+	}
+
+	if fileSize < minimumRequiredSize {
+		err = errors.New("file is too small to generate a valid hash")
+		return
+	}
+
+	totalBufferNeeded := int64(0)
+	for _, span := range chunks {
+		totalBufferNeeded += span.size
+	}
+
+	buf = make([]byte, totalBufferNeeded)
+	filled := 0
+	for _, span := range chunks {
+		start := span.offset
+		if start < 0 {
+			start += fileSize
+		}
+		err = readRemoteChunk(ctx, client, url, start, buf[filled:filled+int(span.size)])
+		if err != nil {
+			return
+		}
+		filled += int(span.size)
+	}
+	return fileSize, buf, nil
+}
+
+func readChunks(filePath string, minimumRequiredSize int64, chunks ...chunkInfo) (fileSize int64, buf []byte, err error) {
+	if strings.HasPrefix(filePath, "http://") || strings.HasPrefix(filePath, "https://") {
+		fileSize, buf, err = readRemoteChunks(filePath, OSDBChunkSize, chunks...)
+		return
+	}
+
 	file, err := os.Open(filePath)
 	if err != nil {
-		return "", errors.New("couldn't open file for hashing")
+		err = errors.New("couldn't open file for hashing")
+		return
 	}
 
 	fi, err := file.Stat()
 	if err != nil {
-		return "", errors.New("couldn't stat file for hashing")
-	}
-	if fi.Size() < OSDBChunkSize {
-		return "", errors.New("file is too small to generate a valid OSDB hash")
+		err = errors.New("couldn't stat file for hashing")
+		return
 	}
 
-	// Read head and tail blocks
-	buf := make([]byte, OSDBChunkSize*2)
-	err = readChunk(file, 0, buf[:OSDBChunkSize])
-	if err != nil {
+	fileSize = fi.Size()
+	if fileSize < minimumRequiredSize {
+		err = errors.New("file is too small to generate a valid hash")
 		return
 	}
-	err = readChunk(file, fi.Size()-OSDBChunkSize, buf[OSDBChunkSize:])
+
+	totalBufferNeeded := int64(0)
+	for _, span := range chunks {
+		totalBufferNeeded += span.size
+	}
+
+	buf = make([]byte, totalBufferNeeded)
+	filled := 0
+	for _, span := range chunks {
+		start := span.offset
+		if start < 0 {
+			start += fileSize
+		}
+		err = readChunk(file, start, buf[filled:filled+int(span.size)])
+		if err != nil {
+			return
+		}
+		filled += int(span.size)
+	}
+
+	return fileSize, buf, nil
+}
+
+// Generate an OSDB hash for a file.
+func OSDBHashFile(filePath string) (hash string, err error) {
+	var buf []byte
+	fileSize := int64(0)
+
+	spans := []chunkInfo{
+		{0, OSDBChunkSize},
+		{-OSDBChunkSize, OSDBChunkSize},
+	}
+
+	fileSize, buf, err = readChunks(filePath, OSDBChunkSize, spans...)
+
 	if err != nil {
-		return
+		return "", err
 	}
 
 	// Convert to uint64, and sum
@@ -71,9 +171,34 @@ func OSDBHashFile(filePath string) (hash string, err error) {
 		hashUint += num
 	}
 
-	hashUint = hashUint + uint64(fi.Size())
+	hashUint = hashUint + uint64(fileSize)
 
 	return fmt.Sprintf("%016x", hashUint), nil
+}
+
+func readRemoteChunk(ctx context.Context, client *http.Client, url string, offset int64, buf []byte) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return err
+	}
+
+	range_header := "bytes=" + strconv.Itoa(int(offset)) + "-" + strconv.Itoa(int(offset)+len(buf)-1)
+	req.Header.Add("Range", range_header)
+
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	n, err := io.ReadFull(resp.Body, buf)
+	if err != nil {
+		return err
+	}
+	if n != len(buf) {
+		return fmt.Errorf("invalid read %v", n)
+	}
+	return nil
 }
 
 // Read a chunk of a file at `offset` so as to fill `buf`.

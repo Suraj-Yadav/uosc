@@ -796,6 +796,11 @@ function open_subtitle_downloader()
 			args[#args + 1] = file_path
 		end
 
+		if state.path and is_protocol(state.path) then
+			args[#args + 1] = '--hash'
+			args[#args + 1] = state.path
+		end
+
 		if query and #query > 0 then
 			args[#args + 1] = '--query'
 			args[#args + 1] = query
